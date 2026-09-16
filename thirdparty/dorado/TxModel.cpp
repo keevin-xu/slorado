@@ -150,9 +150,34 @@ GatedMLPImpl::GatedMLPImpl(int in_features_, int hidden_features_)
     fc2 = register_module("fc2", Linear(LinearOptions(hidden_features, in_features).bias(false)));
 };
 
+#ifdef HAVE_NPU
+// at::linear, or the openfish NPU GEMM when op is listed in OPENFISH_NPU_OPS (bias added on the host).
+static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &bias) {
+    if (!openfish_npu_op_enabled(op)) {
+        return at::linear(x, weight, bias);
+    }
+    const auto in = x.contiguous();
+    auto sizes = in.sizes().vec();
+    const int64_t in_dim = sizes.back();
+    const int64_t out_dim = weight.size(0);
+    sizes.back() = out_dim;
+    auto out = torch::empty(sizes, in.options());
+    openfish_linear_npu(op, in.data_ptr<float>(), out.data_ptr<float>(), weight.contiguous().data_ptr<float>(),
+                        in.numel() / in_dim, in_dim, out_dim);
+    if (bias.defined()) {
+        out.add_(bias);
+    }
+    return out;
+}
+#endif
+
 torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
     torch::Tensor t;
+#ifdef HAVE_NPU
+    t = linear_maybe_npu("fc1", x, fc1->weight, fc1->bias);
+#else
     t = at::linear(x, fc1->weight, fc1->bias);
+#endif
 #ifdef OPENFISH_DUMP
     dump_tensor("ff_in", x);
     dump_tensor("ff_fc1_weight", fc1->weight, false);
@@ -166,12 +191,17 @@ torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
     openfish_silu_mul_gpu(t.data_ptr(), silu_o.data_ptr(), M, K);
     t = silu_o;
 #elif defined HAVE_NPU
-    t = t.contiguous();
-    auto M = t.size(0) * t.size(1);
-    auto K = t.size(2) / 2;
-    auto silu_o = torch::empty({t.size(0), t.size(1), K}, t.options());
-    openfish_silu_mul_npu(t.data_ptr<float>(), silu_o.data_ptr<float>(), M, K);
-    t = silu_o;
+    if (openfish_npu_op_enabled("silu_mul")) {
+        t = t.contiguous();
+        auto M = t.size(0) * t.size(1);
+        auto K = t.size(2) / 2;
+        auto silu_o = torch::empty({t.size(0), t.size(1), K}, t.options());
+        openfish_silu_mul_npu(t.data_ptr<float>(), silu_o.data_ptr<float>(), M, K);
+        t = silu_o;
+    } else {
+        const auto chunks = t.chunk(2, -1);
+        t = functional::silu(chunks[1]).mul_(chunks[0]);
+    }
 #else
     const auto chunks = t.chunk(2, -1);
     const auto &y = chunks[0];
@@ -180,12 +210,16 @@ torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
 #endif
 #ifdef OPENFISH_DUMP
     dump_tensor("ff_silu_mul_out", t);
-    torch::Tensor fc2_out = at::linear(t, fc2->weight, fc2->bias);
-    dump_tensor("ff_fc2_out", fc2_out);
-    return fc2_out;
-#else
-    return at::linear(t, fc2->weight, fc2->bias);
 #endif
+#ifdef HAVE_NPU
+    torch::Tensor fc2_out = linear_maybe_npu("fc2", t, fc2->weight, fc2->bias);
+#else
+    torch::Tensor fc2_out = at::linear(t, fc2->weight, fc2->bias);
+#endif
+#ifdef OPENFISH_DUMP
+    dump_tensor("ff_fc2_out", fc2_out);
+#endif
+    return fc2_out;
 }
 
 RotaryEmbeddingImpl::RotaryEmbeddingImpl(
