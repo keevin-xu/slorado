@@ -86,6 +86,10 @@ else ifdef rocm
 	CPPFLAGS += -I $(ROCM_INC)
 	LIBS += -Wl,--as-needed -lpthread -Wl,--no-as-needed,"$(LIBTORCH_DIR)/lib/libtorch_hip.so" -Wl,--as-needed,"$(LIBTORCH_DIR)/lib/libc10_hip.so"
 	LDFLAGS += -L$(ROCM_LIB) -lamdhip64 -lrt -ldl
+else ifdef npu
+	# AMD XDNA2 NPU (openfish/npu): CPU torch + selected openfish kernels on the NPU via XRT
+	CPPFLAGS += -DHAVE_NPU=1
+	LDFLAGS += -lxrt_coreutil
 endif
 
 .PHONY: clean distclean test
@@ -148,7 +152,7 @@ $(BUILD_DIR)/toml.o: thirdparty/tomlc99/toml.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(DEPFLAGS) $< -c -o $@
 
 openfish/lib/libopenfish.a:
-	$(MAKE) -C openfish cuda=$(cuda) rocm=$(rocm) ROCM_ROOT=$(ROCM_ROOT) ROCM_ARCH="$(ROCM_ARCH)" CUDA_ROOT=$(CUDA_ROOT) CUDA_ARCH="$(CUDA_ARCH)" lib/libopenfish.a
+	$(MAKE) -C openfish cuda=$(cuda) rocm=$(rocm) npu=$(npu) ROCM_ROOT=$(ROCM_ROOT) ROCM_ARCH="$(ROCM_ARCH)" CUDA_ROOT=$(CUDA_ROOT) CUDA_ARCH="$(CUDA_ARCH)" lib/libopenfish.a
 
 slow5lib/lib/libslow5.a:
 	$(MAKE) -C slow5lib zstd=$(zstd) no_simd=$(no_simd) zstd_local=$(zstd_local) lib/libslow5.a

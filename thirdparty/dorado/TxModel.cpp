@@ -165,6 +165,13 @@ torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
     auto silu_o = torch::empty({t.size(0), t.size(1), K}, t.options());
     openfish_silu_mul_gpu(t.data_ptr(), silu_o.data_ptr(), M, K);
     t = silu_o;
+#elif defined HAVE_NPU
+    t = t.contiguous();
+    auto M = t.size(0) * t.size(1);
+    auto K = t.size(2) / 2;
+    auto silu_o = torch::empty({t.size(0), t.size(1), K}, t.options());
+    openfish_silu_mul_npu(t.data_ptr<float>(), silu_o.data_ptr<float>(), M, K);
+    t = silu_o;
 #else
     const auto chunks = t.chunk(2, -1);
     const auto &y = chunks[0];
