@@ -81,3 +81,5 @@ pyvenv
 beam_exp
 fluke
 minimap2
+# Claude Code local skills/settings (copied + symlinked from ../npu-adapting)
+.claude/

@@ -17,6 +17,96 @@
 using namespace torch::nn;
 using Slice = torch::indexing::Slice;
 
+#ifdef OPENFISH_DUMP
+// Debug-only tensor dump for validating NPU kernels against this CPU path
+// (openfish/npu). Build with -DOPENFISH_DUMP; runtime-enabled by OPENFISH_DUMP_DIR.
+// Dumps encoder layers [0, OPENFISH_DUMP_LAYERS) (default 1) of the first forward
+// pass as .npy, keeping the leading OPENFISH_DUMP_ROWS batch rows (default 4) of
+// activations, plus <dir>/manifest.tsv with full shapes. OPENFISH_DUMP_EXIT=1 exits
+// the process after the last dumped layer. Assumes one runner (-r 1, the default).
+#include <cstdio>
+#include <cstdlib>
+
+static int dump_layer = -1;
+static int64_t dump_encoder_calls = 0;
+
+static int64_t dump_env_int(const char *name, int64_t dflt) {
+    const char *v = std::getenv(name);
+    return v ? std::atoll(v) : dflt;
+}
+
+static std::string dump_shape_str(const torch::Tensor &t, const char *sep) {
+    std::string s;
+    for (int64_t i = 0; i < t.dim(); ++i) {
+        s += (i ? sep : "") + std::to_string(t.size(i));
+    }
+    return s;
+}
+
+static std::string dump_stride_str(const torch::Tensor &t) {
+    std::string s;
+    for (int64_t i = 0; i < t.dim(); ++i) {
+        s += (i ? "," : "") + std::to_string(t.stride(i));
+    }
+    return s;
+}
+
+// batched: activation whose dim 0 is the batch (sliced to the leading rows);
+// otherwise a parameter/buffer saved whole.
+static void dump_tensor(const char *site, const torch::Tensor &t, bool batched = true) {
+    const char *dir = std::getenv("OPENFISH_DUMP_DIR");
+    if (!dir || dump_layer < 0 || !t.defined()) {
+        return;
+    }
+    torch::Tensor s = t.detach();
+    if (batched && s.dim() > 0) {
+        s = s.narrow(0, 0, std::min<int64_t>(s.size(0), dump_env_int("OPENFISH_DUMP_ROWS", 4)));
+    }
+    s = s.to(torch::kCPU).contiguous();
+
+    const char *descr = nullptr;
+    switch (s.scalar_type()) {
+        case torch::kFloat32: descr = "<f4"; break;
+        case torch::kFloat16: descr = "<f2"; break;
+        case torch::kFloat64: descr = "<f8"; break;
+        case torch::kInt64: descr = "<i8"; break;
+        case torch::kInt32: descr = "<i4"; break;
+        case torch::kBool: descr = "|b1"; break;
+        default:
+            ERROR("OPENFISH_DUMP: unsupported dtype for %s", site);
+            return;
+    }
+
+    const std::string name = "L" + std::to_string(dump_layer) + "_" + site + ".npy";
+    const std::string path = std::string(dir) + "/" + name;
+    std::string shape = "(" + dump_shape_str(s, ", ") + (s.dim() == 1 ? ",)" : ")");
+    std::string header = std::string("{'descr': '") + descr + "', 'fortran_order': False, 'shape': " + shape + ", }";
+    header.append(64 - (10 + header.size() + 1) % 64, ' ');
+    header += '\n';
+
+    FILE *fp = std::fopen(path.c_str(), "wb");
+    if (!fp) {
+        ERROR("OPENFISH_DUMP: cannot open %s", path.c_str());
+        return;
+    }
+    const uint16_t header_len = header.size();
+    std::fwrite("\x93NUMPY\x01\x00", 1, 8, fp);
+    std::fwrite(&header_len, sizeof(header_len), 1, fp);
+    std::fwrite(header.data(), 1, header.size(), fp);
+    std::fwrite(s.data_ptr(), s.element_size(), s.numel(), fp);
+    std::fclose(fp);
+
+    const std::string manifest = std::string(dir) + "/manifest.tsv";
+    FILE *mf = std::fopen(manifest.c_str(), "a");
+    if (mf) {
+        std::fprintf(mf, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", dump_layer, site,
+                     dump_shape_str(t, "x").c_str(), dump_shape_str(s, "x").c_str(),
+                     dump_stride_str(t).c_str(), descr, name.c_str());
+        std::fclose(mf);
+    }
+}
+#endif
+
 void apply_rounding(torch::Tensor &t, int remove_bits) {
     // Round Float16 tensor elements such that the last `remove_bits` of the mantissa are 0s.
     // TODO: this is slightly dangerous as it will turn numbers close to +/-65304 into +/-inf
@@ -63,6 +153,12 @@ GatedMLPImpl::GatedMLPImpl(int in_features_, int hidden_features_)
 torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
     torch::Tensor t;
     t = at::linear(x, fc1->weight, fc1->bias);
+#ifdef OPENFISH_DUMP
+    dump_tensor("ff_in", x);
+    dump_tensor("ff_fc1_weight", fc1->weight, false);
+    dump_tensor("ff_fc2_weight", fc2->weight, false);
+    dump_tensor("ff_fc1_out", t);
+#endif
 #ifdef USE_GPU
     auto M = t.size(0) * t.size(1);
     auto K = t.size(2) / 2;
@@ -75,7 +171,14 @@ torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
     const auto &gate = chunks[1];
     t = functional::silu(gate).mul_(y);
 #endif
+#ifdef OPENFISH_DUMP
+    dump_tensor("ff_silu_mul_out", t);
+    torch::Tensor fc2_out = at::linear(t, fc2->weight, fc2->bias);
+    dump_tensor("ff_fc2_out", fc2_out);
+    return fc2_out;
+#else
     return at::linear(t, fc2->weight, fc2->bias);
+#endif
 }
 
 RotaryEmbeddingImpl::RotaryEmbeddingImpl(
@@ -259,9 +362,20 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x) {
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_mm += b-a;
+#ifdef OPENFISH_DUMP
+    dump_tensor("attn_in", x);
+    dump_tensor("attn_wqkv_weight", wqkv->weight, false);
+    dump_tensor("attn_wqkv_bias", wqkv->bias, false);
+    dump_tensor("attn_qkv_linear_out", qkv);
+    dump_tensor("attn_rotary_sin", rotary_emb->sin_buf, false);
+    dump_tensor("attn_rotary_cos", rotary_emb->cos_buf, false);
+#endif
 
     a = realtime();
     qkv = rotary_emb(qkv);
+#ifdef OPENFISH_DUMP
+    dump_tensor("attn_qkv_rotary_out", qkv);
+#endif
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_rotary_emb += b-a;
@@ -327,9 +441,18 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x) {
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_sdp_attn += b-a;
+#ifdef OPENFISH_DUMP
+    dump_tensor("attn_window_mask", get_attn_window_mask(T), false);
+    dump_tensor("attn_sdpa_out", attn_output_ntc);
+    dump_tensor("attn_out_proj_weight", out_proj->weight, false);
+    dump_tensor("attn_out_proj_bias", out_proj->bias, false);
+#endif
 
     a = realtime();
     x = at::linear(attn_output_ntc, out_proj->weight, out_proj->bias);
+#ifdef OPENFISH_DUMP
+    dump_tensor("attn_out_proj_out", x);
+#endif
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_out_proj += b-a;
@@ -377,14 +500,30 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
 #endif
     };
 
+#ifdef OPENFISH_DUMP
+    dump_layer = dump_encoder_calls < dump_env_int("OPENFISH_DUMP_LAYERS", 1) ? (int)dump_encoder_calls : -1;
+    ++dump_encoder_calls;
+    dump_tensor("enc_in", x);
+    dump_tensor("norm_deepnorm_alpha", deepnorm_alpha, false);
+    dump_tensor("norm1_weight", norm1->weight, false);
+    dump_tensor("norm2_weight", norm2->weight, false);
+#endif
+
     a = realtime();
     attn = self_attn(x);
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_self_attn += b-a;
 
+#ifdef OPENFISH_DUMP
+    dump_tensor("norm1_in", attn);
+    dump_tensor("norm1_residual", x);
+#endif
     a = realtime();
     run_norm(norm1, attn, norm1->weight);
+#ifdef OPENFISH_DUMP
+    dump_tensor("norm1_out", x);
+#endif
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_norm1 += b-a;
@@ -395,12 +534,30 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
     b = realtime();
     model_stats->time_ff += b-a;
 
+#ifdef OPENFISH_DUMP
+    dump_tensor("norm2_in", f);
+    dump_tensor("norm2_residual", x);
+#endif
     a = realtime();
     run_norm(norm2, f, norm2->weight);
+#ifdef OPENFISH_DUMP
+    dump_tensor("norm2_out", x);
+#endif
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_norm2 += b-a;
-    
+
+#ifdef OPENFISH_DUMP
+    if (dump_layer >= 0) {
+        dump_tensor("enc_out", x);
+        if (dump_layer + 1 == dump_env_int("OPENFISH_DUMP_LAYERS", 1) && std::getenv("OPENFISH_DUMP_EXIT")) {
+            std::fprintf(stderr, "[OPENFISH_DUMP] dumped %d layer(s) to %s; exiting\n", dump_layer + 1, std::getenv("OPENFISH_DUMP_DIR"));
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
+    }
+    dump_layer = -1;
+#endif
     return x;
 }
 
