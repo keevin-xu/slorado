@@ -25,12 +25,15 @@ using Slice = torch::indexing::Slice;
 // Dumps encoder layers [0, OPENFISH_DUMP_LAYERS) (default 1) of the first forward
 // pass as .npy, keeping the leading OPENFISH_DUMP_ROWS batch rows (default 4) of
 // activations, plus <dir>/manifest.tsv with full shapes. OPENFISH_DUMP_EXIT=1 exits
-// the process after the last dumped layer. Assumes one runner (-r 1, the default).
+// the process after the last dumped layer. OPENFISH_DUMP_TAIL=1 also dumps the upsample and
+// CRF linears (as layer 99) of the first forward, exiting after them instead.
+// Assumes one runner (-r 1, the default).
 #include <cstdio>
 #include <cstdlib>
 
 static int dump_layer = -1;
 static int64_t dump_encoder_calls = 0;
+static bool dump_tail_pending = true;
 
 static int64_t dump_env_int(const char *name, int64_t dflt) {
     const char *v = std::getenv(name);
@@ -440,7 +443,11 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x) {
     double a, b;
     
     a = realtime();
+#ifdef HAVE_NPU
+    auto qkv = linear_maybe_npu("wqkv", x, wqkv->weight, wqkv->bias)
+#else
     auto qkv = at::linear(x, wqkv->weight, wqkv->bias)
+#endif
                    .view({N, T, 3, nhead, head_dim});
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
@@ -532,7 +539,11 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x) {
 #endif
 
     a = realtime();
+#ifdef HAVE_NPU
+    x = linear_maybe_npu("out_proj", attn_output_ntc, out_proj->weight, out_proj->bias);
+#else
     x = at::linear(attn_output_ntc, out_proj->weight, out_proj->bias);
+#endif
 #ifdef OPENFISH_DUMP
     dump_tensor("attn_out_proj_out", x);
 #endif
@@ -633,7 +644,8 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
 #ifdef OPENFISH_DUMP
     if (dump_layer >= 0) {
         dump_tensor("enc_out", x);
-        if (dump_layer + 1 == dump_env_int("OPENFISH_DUMP_LAYERS", 1) && std::getenv("OPENFISH_DUMP_EXIT")) {
+        if (dump_layer + 1 == dump_env_int("OPENFISH_DUMP_LAYERS", 1) && std::getenv("OPENFISH_DUMP_EXIT") &&
+            !std::getenv("OPENFISH_DUMP_TAIL")) {
             std::fprintf(stderr, "[OPENFISH_DUMP] dumped %d layer(s) to %s; exiting\n", dump_layer + 1, std::getenv("OPENFISH_DUMP_DIR"));
             std::fflush(nullptr);
             std::_Exit(0);
@@ -664,7 +676,11 @@ torch::Tensor LinearUpsampleImpl::forward(const torch::Tensor &x) {
     const int64_t N = x.size(0);
     const int64_t T = x.size(1);
     const int64_t C = x.size(2);
+#ifdef HAVE_NPU
+    torch::Tensor out = linear_maybe_npu("upsample", x, linear->weight, linear->bias).reshape({N, scale_factor * T, C});
+#else
     torch::Tensor out = linear(x).reshape({N, scale_factor * T, C});
+#endif
     return out;
 };
 
@@ -678,7 +694,11 @@ torch::Tensor LinearScaledCRFImpl::forward(const torch::Tensor &x) {
         linear->weight *= m_params.scale;
         scale_applied = true;
     }
+#ifdef HAVE_NPU
+    return linear_maybe_npu("crf", x, linear->weight, linear->bias);
+#else
     return linear(x);
+#endif
 }
 
 TxModelImpl::TxModelImpl(const CRFModelConfig &config, const torch::TensorOptions &options, tx_stats_t *_model_stats) : m_options(options) {
@@ -706,17 +726,47 @@ torch::Tensor TxModelImpl::forward(const torch::Tensor &x) {
     b = realtime();
     model_stats->time_tx_encoder += b-a;
 
+#ifdef OPENFISH_DUMP
+    const bool dump_tail = dump_tail_pending && std::getenv("OPENFISH_DUMP_TAIL");
+    if (dump_tail) {
+        dump_layer = 99;
+        dump_tensor("tail_up_in", h);
+        dump_tensor("tail_up_weight", tx_decoder->linear->weight, false);
+        dump_tensor("tail_up_bias", tx_decoder->linear->bias, false);
+    }
+#endif
+
     a = realtime();
     h = tx_decoder(h);
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_tx_decoder += b-a;
 
+#ifdef OPENFISH_DUMP
+    if (dump_tail) {
+        dump_tensor("tail_up_out", h);
+    }
+#endif
+
     a = realtime();
     h = crf(h);
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_crf += b-a;
+
+#ifdef OPENFISH_DUMP
+    if (dump_tail) {
+        dump_tensor("tail_crf_weight", crf->linear->weight, false);  // already multiplied by the CRF scale
+        dump_tensor("tail_crf_out", h);
+        dump_layer = -1;
+        dump_tail_pending = false;
+        if (std::getenv("OPENFISH_DUMP_EXIT")) {
+            std::fprintf(stderr, "[OPENFISH_DUMP] dumped encoder layers + tail to %s; exiting\n", std::getenv("OPENFISH_DUMP_DIR"));
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
+    }
+#endif
 
     // Returns: NTC
     return h;
