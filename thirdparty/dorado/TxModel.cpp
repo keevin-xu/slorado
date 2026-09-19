@@ -12,6 +12,8 @@
 #include <ATen/ops/scaled_dot_product_attention.h>
 
 #include <stdexcept>
+#include <unordered_map>
+#include <mutex>
 #include <string>
 
 using namespace torch::nn;
@@ -151,23 +153,61 @@ GatedMLPImpl::GatedMLPImpl(int in_features_, int hidden_features_)
 };
 
 #ifdef HAVE_NPU
-// at::linear, or the openfish NPU GEMM when op is listed in OPENFISH_NPU_OPS (bias added on the host).
+// The openfish NPU backend takes float32 host memory. On the GPU path (fp16 on the iGPU) tensors are copied
+// to the host and back around each NPU call.
+static bool is_host_f32(const torch::Tensor &t) {
+    return t.device().is_cpu() && t.scalar_type() == torch::kFloat32;
+}
+
+static torch::Tensor to_host_f32(const torch::Tensor &t) {
+    return is_host_f32(t) ? t.contiguous() : t.to(torch::kCPU, torch::kFloat32).contiguous();
+}
+
+// Host float32 copy of a weight, made once per weight tensor (the NPU caches its bf16 copy by this pointer).
+static const float *host_weight_f32(const torch::Tensor &w) {
+    if (is_host_f32(w) && w.is_contiguous()) {
+        return w.data_ptr<float>();
+    }
+    static std::mutex mutex;
+    static std::unordered_map<const void *, torch::Tensor> cache;
+    std::lock_guard<std::mutex> guard(mutex);
+    auto it = cache.find(w.data_ptr());
+    if (it == cache.end()) {
+        it = cache.emplace(w.data_ptr(), to_host_f32(w)).first;
+    }
+    return it->second.data_ptr<float>();
+}
+
+// at::linear, or the openfish NPU GEMM when op is listed in OPENFISH_NPU_OPS (bias added after the NPU call).
 static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &bias) {
     if (!openfish_npu_op_enabled(op)) {
         return at::linear(x, weight, bias);
     }
-    const auto in = x.contiguous();
+    const auto in = to_host_f32(x);
     auto sizes = in.sizes().vec();
     const int64_t in_dim = sizes.back();
     const int64_t out_dim = weight.size(0);
     sizes.back() = out_dim;
     auto out = torch::empty(sizes, in.options());
-    openfish_linear_npu(op, in.data_ptr<float>(), out.data_ptr<float>(), weight.contiguous().data_ptr<float>(),
+    openfish_linear_npu(op, in.data_ptr<float>(), out.data_ptr<float>(), host_weight_f32(weight),
                         in.numel() / in_dim, in_dim, out_dim);
+    if (!is_host_f32(x)) {
+        out = out.to(x.device(), x.scalar_type());
+    }
     if (bias.defined()) {
         out.add_(bias);
     }
     return out;
+}
+
+// openfish silu_mul on the NPU: t[..., 2K] = [y ‖ gate] -> [..., K].
+static torch::Tensor silu_mul_npu_tensor(const torch::Tensor &t) {
+    const auto in = to_host_f32(t);
+    auto M = in.size(0) * in.size(1);
+    auto K = in.size(2) / 2;
+    auto out = torch::empty({in.size(0), in.size(1), K}, in.options());
+    openfish_silu_mul_npu(in.data_ptr<float>(), out.data_ptr<float>(), M, K);
+    return is_host_f32(t) ? out : out.to(t.device(), t.scalar_type());
 }
 #endif
 
@@ -185,19 +225,21 @@ torch::Tensor GatedMLPImpl::forward(const torch::Tensor &x) {
     dump_tensor("ff_fc1_out", t);
 #endif
 #ifdef USE_GPU
-    auto M = t.size(0) * t.size(1);
-    auto K = t.size(2) / 2;
-    auto silu_o = torch::empty({t.size(0), t.size(1), K}, t.options());
-    openfish_silu_mul_gpu(t.data_ptr(), silu_o.data_ptr(), M, K);
-    t = silu_o;
-#elif defined HAVE_NPU
+#ifdef HAVE_NPU
     if (openfish_npu_op_enabled("silu_mul")) {
-        t = t.contiguous();
+        t = silu_mul_npu_tensor(t);
+    } else
+#endif
+    {
         auto M = t.size(0) * t.size(1);
         auto K = t.size(2) / 2;
         auto silu_o = torch::empty({t.size(0), t.size(1), K}, t.options());
-        openfish_silu_mul_npu(t.data_ptr<float>(), silu_o.data_ptr<float>(), M, K);
+        openfish_silu_mul_gpu(t.data_ptr(), silu_o.data_ptr(), M, K);
         t = silu_o;
+    }
+#elif defined HAVE_NPU
+    if (openfish_npu_op_enabled("silu_mul")) {
+        t = silu_mul_npu_tensor(t);
     } else {
         const auto chunks = t.chunk(2, -1);
         t = functional::silu(chunks[1]).mul_(chunks[0]);

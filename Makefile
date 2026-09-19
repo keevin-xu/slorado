@@ -86,8 +86,11 @@ else ifdef rocm
 	CPPFLAGS += -I $(ROCM_INC)
 	LIBS += -Wl,--as-needed -lpthread -Wl,--no-as-needed,"$(LIBTORCH_DIR)/lib/libtorch_hip.so" -Wl,--as-needed,"$(LIBTORCH_DIR)/lib/libc10_hip.so"
 	LDFLAGS += -L$(ROCM_LIB) -lamdhip64 -lrt -ldl
-else ifdef npu
-	# AMD XDNA2 NPU (openfish/npu): CPU torch + selected openfish kernels on the NPU via XRT
+endif
+
+# AMD XDNA2 NPU (openfish/npu): selected openfish kernels on the NPU via XRT, on top of the CPU build
+# (npu=1) or the iGPU build (rocm=1 npu=1)
+ifdef npu
 	CPPFLAGS += -DHAVE_NPU=1
 	LDFLAGS += -lxrt_coreutil
 endif
