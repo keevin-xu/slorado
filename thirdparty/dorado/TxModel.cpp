@@ -302,6 +302,28 @@ torch::Tensor RotaryEmbeddingImpl::forward(torch::Tensor &qkv) {
 
     auto qkv_chunks = qkv.chunk(3, 2);
 
+#ifdef HAVE_NPU
+    if (openfish_npu_op_enabled("rope")) {
+        // q and k rows -> [N, 2, T, H, D] contiguous; rows of (t, h) repeat every T*H rows, so one LUT of
+        // T*H rows of [cos(D/2), sin(D/2)] (SUP's own tables) serves every launch.
+        static torch::Tensor lut;
+        const int64_t half = head_dim / 2;
+        if (!lut.defined() || lut.size(0) != (int64_t)seqlen * nheads) {
+            auto c = cos_buf.narrow(0, 0, seqlen).narrow(1, 0, half).to(torch::kCPU, torch::kFloat32);
+            auto sn = sin_buf.narrow(0, 0, seqlen).narrow(1, 0, half).to(torch::kCPU, torch::kFloat32);
+            lut = torch::cat({c, sn}, 1).unsqueeze(1).expand({seqlen, nheads, head_dim})
+                      .reshape({(int64_t)seqlen * nheads, head_dim}).contiguous();
+        }
+        auto qk = qkv.narrow(2, 0, 2).permute({0, 2, 1, 3, 4});
+        const auto in = to_host_f32(qk);
+        auto out = torch::empty_like(in);
+        openfish_rope_npu(in.data_ptr<float>(), lut.data_ptr<float>(), out.data_ptr<float>(),
+                          in.numel() / head_dim, head_dim);
+        qk.copy_(is_host_f32(qkv) ? out : out.to(qkv.device(), qkv.scalar_type()));
+        return qkv;
+    }
+#endif
+
 #ifdef USE_GPU
     if (!qkv.device().is_cpu()) {
         openfish_rotary_emb_gpu(
@@ -571,6 +593,18 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
     double a, b;
 
     auto run_norm = [&](RMSNorm &norm, const torch::Tensor &in, at::Tensor &weight) {
+#ifdef HAVE_NPU
+        if (openfish_npu_op_enabled("rmsnorm")) {
+            // deepnorm: RMSNorm(in + x * alpha) * weight; residual folded here, norm on the NPU
+            const float alpha = deepnorm_alpha.flatten()[0].item<float>();
+            const auto k = to_host_f32(in) + to_host_f32(x) * alpha;
+            auto out = torch::empty_like(k);
+            openfish_rmsnorm_npu(k.data_ptr<float>(), host_weight_f32(weight), out.data_ptr<float>(),
+                                 k.numel() / k.size(-1), k.size(-1));
+            x = is_host_f32(in) ? out : out.to(in.device(), in.scalar_type());
+            return;
+        }
+#endif
 #if defined USE_GPU
         auto MN = in.size(0) * in.size(1);
         auto output = torch::empty({in.size(0), in.size(1), in.size(2)}, in.options());
