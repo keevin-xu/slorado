@@ -166,6 +166,19 @@ static torch::Tensor to_host_f32(const torch::Tensor &t) {
     return is_host_f32(t) ? t.contiguous() : t.to(torch::kCPU, torch::kFloat32).contiguous();
 }
 
+// iGPU path: cast to bf16 on the GPU, then copy the 2-byte values to the host (no CPU-side conversion).
+static torch::Tensor to_host_bf16(const torch::Tensor &t) {
+    return t.to(torch::kBFloat16).to(torch::kCPU).contiguous();
+}
+
+static const uint16_t *bf16_ptr(const torch::Tensor &t) { return reinterpret_cast<const uint16_t *>(t.data_ptr()); }
+static uint16_t *bf16_ptr(torch::Tensor &t) { return reinterpret_cast<uint16_t *>(t.data_ptr()); }
+
+// Back to the original device and dtype: copy the bf16 values over, then cast on that device.
+static torch::Tensor from_host_bf16(const torch::Tensor &host, const torch::Tensor &like) {
+    return host.to(like.device()).to(like.scalar_type());
+}
+
 // Host float32 copy of a weight, made once per weight tensor (the NPU caches its bf16 copy by this pointer).
 static const float *host_weight_f32(const torch::Tensor &w) {
     if (is_host_f32(w) && w.is_contiguous()) {
@@ -186,6 +199,20 @@ static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, co
     if (!openfish_npu_op_enabled(op)) {
         return at::linear(x, weight, bias);
     }
+    if (!is_host_f32(x)) {
+        const auto in = to_host_bf16(x);
+        auto sizes = in.sizes().vec();
+        const int64_t in_dim = sizes.back();
+        const int64_t out_dim = weight.size(0);
+        sizes.back() = out_dim;
+        auto out = torch::empty(sizes, in.options());
+        openfish_linear_npu_bf16(op, bf16_ptr(in), bf16_ptr(out), host_weight_f32(weight), in.numel() / in_dim, in_dim, out_dim);
+        auto res = from_host_bf16(out, x);
+        if (bias.defined()) {
+            res.add_(bias);
+        }
+        return res;
+    }
     const auto in = to_host_f32(x);
     auto sizes = in.sizes().vec();
     const int64_t in_dim = sizes.back();
@@ -205,6 +232,12 @@ static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, co
 
 // openfish silu_mul on the NPU: t[..., 2K] = [y ‖ gate] -> [..., K].
 static torch::Tensor silu_mul_npu_tensor(const torch::Tensor &t) {
+    if (!is_host_f32(t)) {
+        const auto in = to_host_bf16(t);
+        auto out = torch::empty({in.size(0), in.size(1), in.size(2) / 2}, in.options());
+        openfish_silu_mul_npu_bf16(bf16_ptr(in), bf16_ptr(out), in.size(0) * in.size(1), in.size(2) / 2);
+        return from_host_bf16(out, t);
+    }
     const auto in = to_host_f32(t);
     auto M = in.size(0) * in.size(1);
     auto K = in.size(2) / 2;
@@ -315,6 +348,13 @@ torch::Tensor RotaryEmbeddingImpl::forward(torch::Tensor &qkv) {
                       .reshape({(int64_t)seqlen * nheads, head_dim}).contiguous();
         }
         auto qk = qkv.narrow(2, 0, 2).permute({0, 2, 1, 3, 4});
+        if (!is_host_f32(qkv)) {
+            const auto inb = to_host_bf16(qk);
+            auto outb = torch::empty_like(inb);
+            openfish_rope_npu_bf16(bf16_ptr(inb), lut.data_ptr<float>(), bf16_ptr(outb), inb.numel() / head_dim, head_dim);
+            qk.copy_(outb.to(qkv.device()));
+            return qkv;
+        }
         const auto in = to_host_f32(qk);
         auto out = torch::empty_like(in);
         openfish_rope_npu(in.data_ptr<float>(), lut.data_ptr<float>(), out.data_ptr<float>(),
@@ -597,6 +637,15 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
         if (openfish_npu_op_enabled("rmsnorm")) {
             // deepnorm: RMSNorm(in + x * alpha) * weight; residual folded here, norm on the NPU
             const float alpha = deepnorm_alpha.flatten()[0].item<float>();
+            if (!is_host_f32(in)) {
+                // residual folded on the GPU in fp32, then bf16 to the NPU
+                const auto kb = to_host_bf16(in.to(torch::kFloat32) + x.to(torch::kFloat32) * alpha);
+                auto ob = torch::empty_like(kb);
+                openfish_rmsnorm_npu_bf16(bf16_ptr(kb), host_weight_f32(weight), bf16_ptr(ob), kb.numel() / kb.size(-1),
+                                          kb.size(-1));
+                x = from_host_bf16(ob, in);
+                return;
+            }
             const auto k = to_host_f32(in) + to_host_f32(x) * alpha;
             auto out = torch::empty_like(k);
             openfish_rmsnorm_npu(k.data_ptr<float>(), host_weight_f32(weight), out.data_ptr<float>(),

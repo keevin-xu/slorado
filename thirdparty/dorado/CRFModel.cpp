@@ -43,8 +43,22 @@ static torch::Tensor conv1d_npu(torch::nn::Conv1d &conv, const torch::Tensor &x,
     const int64_t Tout = patches.size(1);  // [N, Tout, Cin, k]
     auto out = torch::empty({N, Tout, Cout}, x.options());
     const int64_t slice = 8;  // chunks per NPU call: bounds the host fp32 im2col buffer
+    const bool host = x.device().is_cpu() && x.scalar_type() == torch::kFloat32;
     for (int64_t b = 0; b < N; b += slice) {
         const int64_t nb = std::min(slice, N - b);
+        if (!host) {
+            // iGPU path: pad + cast to bf16 on the GPU, copy 2-byte values, NPU, copy back, cast on the GPU
+            auto ab = patches.narrow(0, b, nb).reshape({nb * Tout, K});
+            if (Kp != K) {
+                ab = torch::constant_pad_nd(ab, {0, Kp - K});
+            }
+            ab = ab.to(torch::kBFloat16).to(torch::kCPU).contiguous();
+            auto ob = torch::empty({nb * Tout, Np}, ab.options());
+            openfish_linear_npu_bf16("conv", reinterpret_cast<const uint16_t *>(ab.data_ptr()),
+                                     reinterpret_cast<uint16_t *>(ob.data_ptr()), wp.data_ptr<float>(), nb * Tout, Kp, Np);
+            out.narrow(0, b, nb).copy_(ob.narrow(1, 0, Cout).reshape({nb, Tout, Cout}).to(x.device()));
+            continue;
+        }
         auto a = patches.narrow(0, b, nb).reshape({nb * Tout, K}).to(torch::kCPU, torch::kFloat32);
         if (Kp != K) {
             a = torch::constant_pad_nd(a, {0, Kp - K});
