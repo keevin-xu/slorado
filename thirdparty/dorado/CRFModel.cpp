@@ -6,11 +6,60 @@
 #include "misc.h"
 #include "tensor_chunk_utils.h"
 
-#ifdef USE_GPU
+#if defined(USE_GPU) || defined(HAVE_NPU)
 #include <openfish/openfish.h>
 #endif
 
+#ifdef HAVE_NPU
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+#endif
+
 using namespace torch::nn;
+
+#ifdef HAVE_NPU
+// Conv1d on the NPU as im2col + the openfish NPU GEMM (OPENFISH_NPU_OPS "conv"). The fused-cast GEMM ELF
+// needs K % 256 == 0 and N % 512 == 0, so patches and the (cached, host fp32) weight are zero-padded.
+static torch::Tensor conv1d_npu(torch::nn::Conv1d &conv, const torch::Tensor &x, int winlen, int stride) {
+    const auto &w = conv->weight;  // [Cout, Cin, k]
+    const int64_t Cout = w.size(0), K = w.size(1) * w.size(2), k = w.size(2);
+    const int64_t Kp = (K + 255) / 256 * 256, Np = (Cout + 511) / 512 * 512;
+    static std::mutex mutex;
+    static std::unordered_map<const void *, torch::Tensor> wcache;
+    torch::Tensor wp;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = wcache.find(w.data_ptr());
+        if (it == wcache.end()) {
+            auto t = torch::zeros({Np, Kp}, torch::TensorOptions().dtype(torch::kFloat32));
+            t.narrow(0, 0, Cout).narrow(1, 0, K).copy_(w.reshape({Cout, K}).to(torch::kCPU, torch::kFloat32));
+            it = wcache.emplace(w.data_ptr(), t).first;
+        }
+        wp = it->second;
+    }
+    const int64_t N = x.size(0);
+    auto patches = torch::constant_pad_nd(x, {winlen / 2, winlen / 2}).unfold(2, k, stride).permute({0, 2, 1, 3});
+    const int64_t Tout = patches.size(1);  // [N, Tout, Cin, k]
+    auto out = torch::empty({N, Tout, Cout}, x.options());
+    const int64_t slice = 8;  // chunks per NPU call: bounds the host fp32 im2col buffer
+    for (int64_t b = 0; b < N; b += slice) {
+        const int64_t nb = std::min(slice, N - b);
+        auto a = patches.narrow(0, b, nb).reshape({nb * Tout, K}).to(torch::kCPU, torch::kFloat32);
+        if (Kp != K) {
+            a = torch::constant_pad_nd(a, {0, Kp - K});
+        }
+        a = a.contiguous();
+        auto o = torch::empty({nb * Tout, Np}, a.options());
+        openfish_linear_npu("conv", a.data_ptr<float>(), o.data_ptr<float>(), wp.data_ptr<float>(), nb * Tout, Kp, Np);
+        out.narrow(0, b, nb).copy_(o.narrow(1, 0, Cout).reshape({nb, Tout, Cout}));
+    }
+    if (conv->bias.defined()) {
+        out.add_(conv->bias);
+    }
+    return out.permute({0, 2, 1});  // [N, Cout, Tout] like Conv1d
+}
+#endif
 
 ConvStackImpl::ConvStackImpl(const std::vector<ConvParams> &layer_params) {
     for (size_t i = 0; i < layer_params.size(); ++i) {
@@ -26,6 +75,11 @@ ConvStackImpl::ConvStackImpl(const std::vector<ConvParams> &layer_params) {
 torch::Tensor ConvStackImpl::forward(torch::Tensor x) {
     // Input x is [N, C_in, T_in], contiguity optional
     for (auto &layer : layers) {
+#ifdef HAVE_NPU
+        if (openfish_npu_op_enabled("conv")) {
+            x = conv1d_npu(layer.conv, x, layer.params.winlen, layer.params.stride);
+        } else
+#endif
         x = layer.conv(x);
         if (layer.params.activation == Activation::SWISH) {
             torch::silu_(x);
