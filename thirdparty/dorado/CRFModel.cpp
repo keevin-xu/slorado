@@ -19,6 +19,17 @@
 using namespace torch::nn;
 
 #ifdef HAVE_NPU
+bool npu_gemm_out_f32();  // TxModel.cpp: OPENFISH_NPU_GEMM_OUT=f32
+
+// swish on the NPU (mlir-air silu, op "swish"): bf16 on the host, back to x's device and dtype.
+static torch::Tensor silu_npu(const torch::Tensor &x) {
+    auto xb = x.to(torch::kBFloat16).to(torch::kCPU).contiguous();
+    auto ob = torch::empty_like(xb);
+    openfish_silu_npu_bf16(reinterpret_cast<const uint16_t *>(xb.data_ptr()), reinterpret_cast<uint16_t *>(ob.data_ptr()),
+                           xb.numel());
+    return ob.to(x.device()).to(x.scalar_type());
+}
+
 // Conv1d on the NPU as im2col + the openfish NPU GEMM (OPENFISH_NPU_OPS "conv"). The fused-cast GEMM ELF
 // needs K % 256 == 0 and N % 512 == 0, so patches and the (cached, host fp32) weight are zero-padded.
 static torch::Tensor conv1d_npu(torch::nn::Conv1d &conv, const torch::Tensor &x, int winlen, int stride) {
@@ -53,9 +64,16 @@ static torch::Tensor conv1d_npu(torch::nn::Conv1d &conv, const torch::Tensor &x,
                 ab = torch::constant_pad_nd(ab, {0, Kp - K});
             }
             ab = ab.to(torch::kBFloat16).to(torch::kCPU).contiguous();
-            auto ob = torch::empty({nb * Tout, Np}, ab.options());
-            openfish_linear_npu_bf16("conv", reinterpret_cast<const uint16_t *>(ab.data_ptr()),
-                                     reinterpret_cast<uint16_t *>(ob.data_ptr()), wp.data_ptr<float>(), nb * Tout, Kp, Np);
+            torch::Tensor ob;
+            if (npu_gemm_out_f32()) {
+                ob = torch::empty({nb * Tout, Np}, ab.options().dtype(torch::kFloat32));
+                openfish_linear_npu_bf16_f32("conv", reinterpret_cast<const uint16_t *>(ab.data_ptr()), ob.data_ptr<float>(),
+                                             wp.data_ptr<float>(), nb * Tout, Kp, Np);
+            } else {
+                ob = torch::empty({nb * Tout, Np}, ab.options());
+                openfish_linear_npu_bf16("conv", reinterpret_cast<const uint16_t *>(ab.data_ptr()),
+                                         reinterpret_cast<uint16_t *>(ob.data_ptr()), wp.data_ptr<float>(), nb * Tout, Kp, Np);
+            }
             out.narrow(0, b, nb).copy_(ob.narrow(1, 0, Cout).reshape({nb, Tout, Cout}).to(x.device()));
             continue;
         }
@@ -95,10 +113,16 @@ torch::Tensor ConvStackImpl::forward(torch::Tensor x) {
         } else
 #endif
         x = layer.conv(x);
-        if (layer.params.activation == Activation::SWISH) {
+        if (layer.params.activation == Activation::SWISH || layer.params.activation == Activation::SWISH_CLAMP) {
+#ifdef HAVE_NPU
+            if (openfish_npu_op_enabled("swish") && !(x.device().is_cpu() && x.scalar_type() == torch::kFloat32)) {
+                x = silu_npu(x);
+            } else
+#endif
             torch::silu_(x);
-        } else if (layer.params.activation == Activation::SWISH_CLAMP) {
-            torch::silu_(x).clamp_(c10::nullopt, 3.5f);
+            if (layer.params.activation == Activation::SWISH_CLAMP) {
+                x.clamp_(c10::nullopt, 3.5f);
+            }
         } else if (layer.params.activation == Activation::TANH) {
             x.tanh_();
         } else {

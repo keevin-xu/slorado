@@ -194,6 +194,44 @@ static const float *host_weight_f32(const torch::Tensor &w) {
     return it->second.data_ptr<float>();
 }
 
+// OPENFISH_NPU_GEMM_OUT=f32: NPU GEMMs return the fp32 accumulator (needed with the f32-out GEMM ELFs,
+// kernels/gemm_f32out); default bf16 (the fused-cast ELF's bf16 output).
+bool npu_gemm_out_f32() {
+    static const bool f32 = [] {
+        const char *e = std::getenv("OPENFISH_NPU_GEMM_OUT");
+        return e && std::string(e) == "f32";
+    }();
+    return f32;
+}
+
+// Deepnorm residual k = in + x * alpha as a host bf16 tensor for the NPU: on the NPU (mlir-air axpy, op
+// "residual") or folded on the GPU in fp32.
+static torch::Tensor deepnorm_residual_host_bf16(const torch::Tensor &in, const torch::Tensor &x, float alpha) {
+    if (openfish_npu_op_enabled("residual")) {
+        const auto xb = to_host_bf16(x);
+        const auto ib = to_host_bf16(in);
+        auto out = torch::empty_like(ib);
+        openfish_axpy_npu_bf16(alpha, bf16_ptr(xb), bf16_ptr(ib), bf16_ptr(out), ib.numel());
+        return out;
+    }
+    return to_host_bf16(in.to(torch::kFloat32) + x.to(torch::kFloat32) * alpha);
+}
+
+// Host fp32 RoPE table for the NPU kernels: T*H rows of [cos(D/2), sin(D/2)] in (t, h) order, from SUP's own tables.
+static const torch::Tensor &rope_lut_host(const torch::Tensor &cos_buf, const torch::Tensor &sin_buf, int64_t T, int64_t H, int64_t D) {
+    static std::mutex mutex;
+    static std::unordered_map<int64_t, torch::Tensor> cache;  // by T * H
+    std::lock_guard<std::mutex> guard(mutex);
+    auto it = cache.find(T * H);
+    if (it == cache.end()) {
+        auto c = cos_buf.narrow(0, 0, T).narrow(1, 0, D / 2).to(torch::kCPU, torch::kFloat32);
+        auto sn = sin_buf.narrow(0, 0, T).narrow(1, 0, D / 2).to(torch::kCPU, torch::kFloat32);
+        auto lut = torch::cat({c, sn}, 1).unsqueeze(1).expand({T, H, D}).reshape({T * H, D}).contiguous();
+        it = cache.emplace(T * H, lut).first;
+    }
+    return it->second;
+}
+
 // at::linear, or the openfish NPU GEMM when op is listed in OPENFISH_NPU_OPS (bias added after the NPU call).
 static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &bias) {
     if (!openfish_npu_op_enabled(op)) {
@@ -205,9 +243,19 @@ static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, co
         const int64_t in_dim = sizes.back();
         const int64_t out_dim = weight.size(0);
         sizes.back() = out_dim;
-        auto out = torch::empty(sizes, in.options());
-        openfish_linear_npu_bf16(op, bf16_ptr(in), bf16_ptr(out), host_weight_f32(weight), in.numel() / in_dim, in_dim, out_dim);
-        auto res = from_host_bf16(out, x);
+        torch::Tensor res;
+        if (npu_gemm_out_f32()) {
+            // fp32 accumulator back to the GPU, cast there (no bf16 rounding of the result)
+            auto out = torch::empty(sizes, in.options().dtype(torch::kFloat32));
+            openfish_linear_npu_bf16_f32(op, bf16_ptr(in), out.data_ptr<float>(), host_weight_f32(weight),
+                                         in.numel() / in_dim, in_dim, out_dim);
+            res = from_host_bf16(out, x);
+        } else {
+            auto out = torch::empty(sizes, in.options());
+            openfish_linear_npu_bf16(op, bf16_ptr(in), bf16_ptr(out), host_weight_f32(weight), in.numel() / in_dim, in_dim,
+                                     out_dim);
+            res = from_host_bf16(out, x);
+        }
         if (bias.defined()) {
             res.add_(bias);
         }
@@ -339,14 +387,7 @@ torch::Tensor RotaryEmbeddingImpl::forward(torch::Tensor &qkv) {
     if (openfish_npu_op_enabled("rope")) {
         // q and k rows -> [N, 2, T, H, D] contiguous; rows of (t, h) repeat every T*H rows, so one LUT of
         // T*H rows of [cos(D/2), sin(D/2)] (SUP's own tables) serves every launch.
-        static torch::Tensor lut;
-        const int64_t half = head_dim / 2;
-        if (!lut.defined() || lut.size(0) != (int64_t)seqlen * nheads) {
-            auto c = cos_buf.narrow(0, 0, seqlen).narrow(1, 0, half).to(torch::kCPU, torch::kFloat32);
-            auto sn = sin_buf.narrow(0, 0, seqlen).narrow(1, 0, half).to(torch::kCPU, torch::kFloat32);
-            lut = torch::cat({c, sn}, 1).unsqueeze(1).expand({seqlen, nheads, head_dim})
-                      .reshape({(int64_t)seqlen * nheads, head_dim}).contiguous();
-        }
+        const torch::Tensor &lut = rope_lut_host(cos_buf, sin_buf, seqlen, nheads, head_dim);
         auto qk = qkv.narrow(2, 0, 2).permute({0, 2, 1, 3, 4});
         if (!is_host_f32(qkv)) {
             const auto inb = to_host_bf16(qk);
@@ -505,12 +546,20 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x) {
     double a, b;
     
     a = realtime();
+    torch::Tensor qkv;
+    bool qkv_rotated = false;
 #ifdef HAVE_NPU
-    auto qkv = linear_maybe_npu("wqkv", x, wqkv->weight, wqkv->bias)
+    if (pending_qkv.defined()) {
+        TORCH_CHECK(pending_qkv.size(0) == N && pending_qkv.size(1) == T, "pending_qkv shape mismatch");
+        qkv = pending_qkv;
+        pending_qkv = torch::Tensor();
+        qkv_rotated = true;
+    } else {
+        qkv = linear_maybe_npu("wqkv", x, wqkv->weight, wqkv->bias).view({N, T, 3, nhead, head_dim});
+    }
 #else
-    auto qkv = at::linear(x, wqkv->weight, wqkv->bias)
+    qkv = at::linear(x, wqkv->weight, wqkv->bias).view({N, T, 3, nhead, head_dim});
 #endif
-                   .view({N, T, 3, nhead, head_dim});
     if (!x.device().is_cpu()) torch::cuda::synchronize(x.device().index());
     b = realtime();
     model_stats->time_mm += b-a;
@@ -524,7 +573,9 @@ torch::Tensor MultiHeadAttentionImpl::forward(torch::Tensor x) {
 #endif
 
     a = realtime();
-    qkv = rotary_emb(qkv);
+    if (!qkv_rotated) {
+        qkv = rotary_emb(qkv);
+    }
 #ifdef OPENFISH_DUMP
     dump_tensor("attn_qkv_rotary_out", qkv);
 #endif
@@ -638,8 +689,8 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
             // deepnorm: RMSNorm(in + x * alpha) * weight; residual folded here, norm on the NPU
             const float alpha = deepnorm_alpha.flatten()[0].item<float>();
             if (!is_host_f32(in)) {
-                // residual folded on the GPU in fp32, then bf16 to the NPU
-                const auto kb = to_host_bf16(in.to(torch::kFloat32) + x.to(torch::kFloat32) * alpha);
+                // residual folded on the GPU in fp32 (or on the NPU, op "residual"), then bf16 to the NPU
+                const auto kb = deepnorm_residual_host_bf16(in, x, alpha);
                 auto ob = torch::empty_like(kb);
                 openfish_rmsnorm_npu_bf16(bf16_ptr(kb), host_weight_f32(weight), bf16_ptr(ob), kb.numel() / kb.size(-1),
                                           kb.size(-1));
@@ -653,6 +704,19 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
             x = is_host_f32(in) ? out : out.to(in.device(), in.scalar_type());
             return;
         }
+#ifdef USE_GPU
+        if (openfish_npu_op_enabled("residual") && !is_host_f32(in)) {
+            // residual alone on the NPU (axpy); the norm stays on the GPU with a zero residual
+            const float alpha = deepnorm_alpha.flatten()[0].item<float>();
+            const auto k = from_host_bf16(deepnorm_residual_host_bf16(in, x, alpha), in).contiguous();
+            const auto zero = torch::zeros_like(k);
+            auto output = torch::empty_like(k);
+            openfish_rmsnorm_gpu(k.data_ptr(), zero.data_ptr(), weight.contiguous().data_ptr(), output.data_ptr(),
+                                 k.size(0) * k.size(1), k.size(2), alpha, 1e-5f);
+            x = output;
+            return;
+        }
+#endif
 #endif
 #if defined USE_GPU
         auto MN = in.size(0) * in.size(1);
@@ -716,6 +780,25 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
     dump_tensor("norm2_residual", x);
 #endif
     a = realtime();
+#ifdef HAVE_NPU
+    if (next_layer && openfish_npu_op_enabled("rms_qkv_rope") && !is_host_f32(f)) {
+        // norm2 of this layer + wqkv and RoPE of the next layer in one NPU call (mlir-air rms_gemms_rope_multi);
+        // the next layer's attention picks up pending_qkv instead of running its own wqkv + RoPE.
+        auto &nattn = next_layer->self_attn;
+        TORCH_CHECK(!nattn->wqkv->bias.defined(), "rms_qkv_rope: wqkv bias not supported");
+        const float alpha = deepnorm_alpha.flatten()[0].item<float>();
+        const auto kb = deepnorm_residual_host_bf16(f, x, alpha);
+        const int64_t N = kb.size(0), T = kb.size(1), C = kb.size(2);
+        const int64_t H = nattn->nhead, D = nattn->head_dim;
+        const auto &lut = rope_lut_host(nattn->rotary_emb->cos_buf, nattn->rotary_emb->sin_buf, T, H, D);
+        auto normed = torch::empty_like(kb);
+        auto qkv = torch::empty({N, T, 3 * C}, kb.options());
+        openfish_rms_qkv_rope_npu_bf16(bf16_ptr(kb), host_weight_f32(norm2->weight), host_weight_f32(nattn->wqkv->weight),
+                                       lut.data_ptr<float>(), bf16_ptr(normed), bf16_ptr(qkv), N * T, T);
+        x = from_host_bf16(normed, f);
+        nattn->pending_qkv = from_host_bf16(qkv, f).view({N, T, 3, H, D});
+    } else
+#endif
     run_norm(norm2, f, norm2->weight);
 #ifdef OPENFISH_DUMP
     dump_tensor("norm2_out", x);
@@ -741,9 +824,18 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
 
 TxEncoderStackImpl::TxEncoderStackImpl(const TxEncoderParams &params, const torch::TensorOptions &options, tx_stats_t *model_stats) {
     stack = Sequential();
+#ifdef HAVE_NPU
+    TxEncoderImpl *prev = nullptr;
+#endif
     for (int i = 0; i < params.depth; ++i) {
         TxEncoder encoder(params, options, model_stats);
         stack->push_back(register_module("transformer_encoder" + std::to_string(i), encoder));
+#ifdef HAVE_NPU
+        if (prev) {
+            prev->next_layer = encoder.get();
+        }
+        prev = encoder.get();
+#endif
     }
 };
 

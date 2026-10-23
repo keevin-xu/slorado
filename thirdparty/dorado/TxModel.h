@@ -109,6 +109,10 @@ struct MultiHeadAttentionImpl : torch::nn::Module {
 
     torch::nn::Linear wqkv{nullptr}, out_proj{nullptr};
     RotaryEmbedding rotary_emb{nullptr};
+#ifdef HAVE_NPU
+    // q, k (rotated) and v from the previous layer's fused NPU norm2 + wqkv + RoPE (OPENFISH_NPU_OPS rms_qkv_rope)
+    torch::Tensor pending_qkv;
+#endif
 
     tx_stats_t *model_stats;
 };
@@ -127,6 +131,9 @@ struct TxEncoderImpl : torch::nn::Module {
     MultiHeadAttention self_attn{nullptr};
     GatedMLP ff{nullptr};
     RMSNorm norm1{nullptr}, norm2{nullptr};
+#ifdef HAVE_NPU
+    TxEncoderImpl *next_layer = nullptr;  // set by TxEncoderStack; target of the fused norm2 + next wqkv + RoPE
+#endif
 
     tx_stats_t *model_stats;
 };
