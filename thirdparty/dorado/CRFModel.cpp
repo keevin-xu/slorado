@@ -21,13 +21,15 @@ using namespace torch::nn;
 #ifdef HAVE_NPU
 bool npu_gemm_out_f32();  // TxModel.cpp: OPENFISH_NPU_GEMM_OUT=f32
 
-// swish on the NPU (mlir-air silu, op "swish"): bf16 on the host, back to x's device and dtype.
+// swish on the NPU (mlir-air silu, op "swish"): bf16 on the host, back into x's device, dtype and memory layout.
 static torch::Tensor silu_npu(const torch::Tensor &x) {
-    auto xb = x.to(torch::kBFloat16).to(torch::kCPU).contiguous();
+    auto xb = x.contiguous().to(torch::kBFloat16).to(torch::kCPU).contiguous();
     auto ob = torch::empty_like(xb);
     openfish_silu_npu_bf16(reinterpret_cast<const uint16_t *>(xb.data_ptr()), reinterpret_cast<uint16_t *>(ob.data_ptr()),
                            xb.numel());
-    return ob.to(x.device()).to(x.scalar_type());
+    auto out = torch::empty_like(x);
+    out.copy_(ob.to(x.device()));
+    return out;
 }
 
 // Conv1d on the NPU as im2col + the openfish NPU GEMM (OPENFISH_NPU_OPS "conv"). The fused-cast GEMM ELF
