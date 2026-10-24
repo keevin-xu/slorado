@@ -432,6 +432,14 @@ torch::Tensor RotaryEmbeddingImpl::forward(torch::Tensor &qkv) {
         // T*H rows of [cos(D/2), sin(D/2)] (SUP's own tables) serves every launch.
         const torch::Tensor &lut = rope_lut_host(cos_buf, sin_buf, seqlen, nheads, head_dim);
         auto qk = qkv.narrow(2, 0, 2).permute({0, 2, 1, 3, 4});
+        if (!qkv.device().is_cpu() && openfish_npu_zerocopy_enabled("rope")) {
+            // zero-copy: q and k rows stay in iGPU memory
+            const auto inb = qk.to(torch::kBFloat16).contiguous();
+            auto outb = torch::empty_like(inb);
+            openfish_rope_npu_dev_bf16(bf16_ptr(inb), lut.data_ptr<float>(), bf16_ptr(outb), inb.numel() / head_dim, head_dim);
+            qk.copy_(outb);
+            return qkv;
+        }
         if (!is_host_f32(qkv)) {
             const auto inb = to_host_bf16(qk);
             auto outb = torch::empty_like(inb);
@@ -733,8 +741,16 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
             const float alpha = deepnorm_alpha.flatten()[0].item<float>();
             if (!is_host_f32(in)) {
                 // residual folded on the GPU in fp32 (or on the NPU, op "residual"), then bf16 to the NPU
-                const auto kb = deepnorm_residual_bf16(in, x, alpha, false);
+                const bool zc = !in.device().is_cpu() && openfish_npu_zerocopy_enabled("rmsnorm");
+                const auto kb = deepnorm_residual_bf16(in, x, alpha, zc);
                 auto ob = torch::empty_like(kb);
+                if (zc) {
+                    // zero-copy: kb and ob are iGPU memory
+                    openfish_rmsnorm_npu_dev_bf16(bf16_ptr(kb), host_weight_f32(weight), bf16_ptr(ob),
+                                                  kb.numel() / kb.size(-1), kb.size(-1));
+                    x = ob.to(in.scalar_type());
+                    return;
+                }
                 openfish_rmsnorm_npu_bf16(bf16_ptr(kb), host_weight_f32(weight), bf16_ptr(ob), kb.numel() / kb.size(-1),
                                           kb.size(-1));
                 x = from_host_bf16(ob, in);
@@ -836,15 +852,16 @@ torch::Tensor TxEncoderImpl::forward(torch::Tensor x) {
         const int64_t H = nattn->nhead, D = nattn->head_dim;
         const auto &lut = rope_lut_host(nattn->rotary_emb->cos_buf, nattn->rotary_emb->sin_buf, T, H, D);
         auto normed = torch::empty_like(kb);
-        auto qkv = torch::empty({N, T, 3 * C}, kb.options());
         if (zc) {
             // zero-copy: kb, normed and qkv are iGPU memory
+            auto q = torch::empty_like(kb), k = torch::empty_like(kb), v = torch::empty_like(kb);
             openfish_rms_qkv_rope_npu_dev_bf16(bf16_ptr(kb), host_weight_f32(norm2->weight),
                                                host_weight_f32(nattn->wqkv->weight), lut.data_ptr<float>(), bf16_ptr(normed),
-                                               bf16_ptr(qkv), N * T, T);
+                                               bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), N * T, T);
             x = normed.to(f.scalar_type());
-            nattn->pending_qkv = qkv.to(f.scalar_type()).view({N, T, 3, H, D});
+            nattn->pending_qkv = torch::cat({q, k, v}, -1).to(f.scalar_type()).view({N, T, 3, H, D});
         } else {
+            auto qkv = torch::empty({N, T, 3 * C}, kb.options());
             openfish_rms_qkv_rope_npu_bf16(bf16_ptr(kb), host_weight_f32(norm2->weight), host_weight_f32(nattn->wqkv->weight),
                                            lut.data_ptr<float>(), bf16_ptr(normed), bf16_ptr(qkv), N * T, T);
             x = from_host_bf16(normed, f);

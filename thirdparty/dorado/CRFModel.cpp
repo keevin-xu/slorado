@@ -59,6 +59,26 @@ static torch::Tensor conv1d_npu(torch::nn::Conv1d &conv, const torch::Tensor &x,
     const bool host = x.device().is_cpu() && x.scalar_type() == torch::kFloat32;
     for (int64_t b = 0; b < N; b += slice) {
         const int64_t nb = std::min(slice, N - b);
+        if (!host && openfish_npu_zerocopy_enabled("conv")) {
+            // zero-copy: patches, NPU input and result stay in iGPU memory (same casts as the copy path below)
+            auto ab = patches.narrow(0, b, nb).reshape({nb * Tout, K});
+            if (Kp != K) {
+                ab = torch::constant_pad_nd(ab, {0, Kp - K});
+            }
+            ab = ab.to(torch::kBFloat16).contiguous();
+            const auto *ap = reinterpret_cast<const uint16_t *>(ab.data_ptr());
+            torch::Tensor ob;
+            if (npu_gemm_out_f32()) {
+                ob = torch::empty({nb * Tout, Np}, ab.options().dtype(torch::kFloat32));
+                openfish_linear_npu_dev_bf16_f32("conv", ap, ob.data_ptr<float>(), wp.data_ptr<float>(), nb * Tout, Kp, Np);
+            } else {
+                ob = torch::empty({nb * Tout, Np}, ab.options());
+                openfish_linear_npu_dev_bf16("conv", ap, reinterpret_cast<uint16_t *>(ob.data_ptr()), wp.data_ptr<float>(),
+                                             nb * Tout, Kp, Np);
+            }
+            out.narrow(0, b, nb).copy_(ob.narrow(1, 0, Cout).reshape({nb, Tout, Cout}));
+            continue;
+        }
         if (!host) {
             // iGPU path: pad + cast to bf16 on the GPU, copy 2-byte values, NPU, copy back, cast on the GPU
             auto ab = patches.narrow(0, b, nb).reshape({nb * Tout, K});
