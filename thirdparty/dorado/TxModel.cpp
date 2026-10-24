@@ -237,6 +237,30 @@ static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, co
     if (!openfish_npu_op_enabled(op)) {
         return at::linear(x, weight, bias);
     }
+    if (!x.device().is_cpu() && openfish_npu_zerocopy_enabled(op)) {
+        // zero-copy (OPENFISH_NPU_ZEROCOPY): the bf16 input and the NPU result stay in iGPU memory; same casts as below
+        const auto in = x.to(torch::kBFloat16).contiguous();
+        auto sizes = in.sizes().vec();
+        const int64_t in_dim = sizes.back();
+        const int64_t out_dim = weight.size(0);
+        sizes.back() = out_dim;
+        torch::Tensor res;
+        if (npu_gemm_out_f32()) {
+            auto out = torch::empty(sizes, in.options().dtype(torch::kFloat32));
+            openfish_linear_npu_dev_bf16_f32(op, bf16_ptr(in), out.data_ptr<float>(), host_weight_f32(weight),
+                                             in.numel() / in_dim, in_dim, out_dim);
+            res = out.to(x.scalar_type());
+        } else {
+            auto out = torch::empty(sizes, in.options());
+            openfish_linear_npu_dev_bf16(op, bf16_ptr(in), bf16_ptr(out), host_weight_f32(weight), in.numel() / in_dim,
+                                         in_dim, out_dim);
+            res = out.to(x.scalar_type());
+        }
+        if (bias.defined()) {
+            res.add_(bias);
+        }
+        return res;
+    }
     if (!is_host_f32(x)) {
         const auto in = to_host_bf16(x);
         auto sizes = in.sizes().vec();
@@ -280,6 +304,16 @@ static torch::Tensor linear_maybe_npu(const char *op, const torch::Tensor &x, co
 
 // openfish silu_mul on the NPU: t[..., 2K] = [y ‖ gate] -> [..., K].
 static torch::Tensor silu_mul_npu_tensor(const torch::Tensor &t) {
+    if (!t.device().is_cpu() && openfish_npu_zerocopy_enabled("silu_mul")) {
+        // zero-copy: cast and split [y | gate] on the iGPU; the NPU reads gate/up and writes out in iGPU memory
+        const auto tb = t.to(torch::kBFloat16);
+        const int64_t K = t.size(2) / 2;
+        const auto up = tb.narrow(2, 0, K).contiguous();
+        const auto gate = tb.narrow(2, K, K).contiguous();
+        auto out = torch::empty({t.size(0), t.size(1), K}, tb.options());
+        openfish_silu_mul_npu_dev_bf16(bf16_ptr(gate), bf16_ptr(up), bf16_ptr(out), (uint64_t)out.numel());
+        return out.to(t.scalar_type());
+    }
     if (!is_host_f32(t)) {
         const auto in = to_host_bf16(t);
         auto out = torch::empty({in.size(0), in.size(1), in.size(2) / 2}, in.options());
